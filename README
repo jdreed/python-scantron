@@ -1,0 +1,4 @@
+Python modules and scripts for serial communication
+with Scantron devices.
+
+Tested on a Scanmark 2500 only, should work on others.
