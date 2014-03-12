@@ -3,6 +3,12 @@ import serial
 
 logger = logging.getLogger('scantron')
 
+class ScantronError(Exception):
+    pass
+
+class EndOfBatchException(Exception):
+    pass
+
 class FormDefinition:
     def __init__(self, num_lines, num_cols=48, identifier=None):
         """
@@ -16,17 +22,22 @@ class FormDefinition:
         padding out to num_cols.  I suspect thats not quite right, and one
         doesn't actually need the padding.
         """
-        self._start = 'FRM=FS %d 0 %d N N N' % (num_lines, num_cols)
-        self._def = []
-        if identifier is not None:
-            # TODO: Pad this maybe with 0s up to position 10, then X
-            self._def.append('FRM=ID 1 %s %d %s' % identifier)
-        self._end = 'FRM=LS'
+        self._num_cols = num_cols
+        # TODO: What is the 0?  What do the various 'N's signify?
+        self.commands = ['FRM=FS %d 0 %d N N N' % (num_lines, num_cols),
+                         'FRM=LS']
 
-    def commands(self):
-        return [self._start] + self._def + [self._end]
-        
-    def fixed_value(self, size=1, value=','):
+    def add_identifer(orientation, position, bitmask):
+        if not FormDefinition._check_orientation(orientation):
+            raise ValueError("Invalid orientation value: " . orientation)
+        # Possibly unneeded, but other software does this.
+        bitmask = bitmask.ljust(10, '0').ljust(self._num_cols, 'X')
+        identifier = 'FRM=ID 1 %s %d %s' % (orientation,
+                                            position,
+                                            bitmask)
+        self.commands.insert(1, identifier)
+
+    def add_fixed_value(self, size=1, value=','):
         """
         A fixed value.  The Scantron will insert this value regardless of
         what it reads.  Typically used for separators or other metadata.
@@ -37,7 +48,7 @@ class FormDefinition:
             raise TypeError("size is not int")
         if len(value) != size:
             raise ValueError("Mismatch between field size and value")
-        self._def.append('FRM=IN %d %s' % (len, value))
+        self.commands.insert(-1, 'FRM=IN %d %s' % (len, value))
 
     # Given a sheet, oriented with the guide marks on the left-hand side,
     # lines go horizontally (1 at the top, columns go vertically (1 at the left).  
@@ -61,10 +72,10 @@ class FormDefinition:
             line_end = line_start
             col_end = col_start - len(values) + size
         tmpl = "FRM=MC N N %d 1 %d %d %d %d %s %d %d %s"
-        self._defs.append(tmpl % (size, line_start, col_start,
-                                  line_end, col_end, orientation,
-                                  field_size, len(values) / size,
-                                  values))
+        self.commands.insert(-1, tmpl % (size, line_start, col_start,
+                                         line_end, col_end, orientation,
+                                         field_size, len(values) / size,
+                                         values))
 
     def add_random_input(self, size, *values):
         # TODO: is 'size' "select at most", or size of data represented by
@@ -74,12 +85,17 @@ class FormDefinition:
         which is one of the values specified.
         value is a 4-tuple of (size, line, col, value)
         """
-        self._def.append("FRM=RI N N %d %s" % (size, ' '.join(
+        self.commands.insert(-1, "FRM=RI N N %d %s" % (size, ' '.join(
                     [' '.join([str(y) for y in x]) for x in values])))
-        
-    
+
+    @staticmethod
+    def _check_orientation(orientation):
+        return orientation in ('L', 'C')
+
 
 class Scantron:
+    END_OF_BATCH = '!'
+
     def __init__(self, device, **kwargs):
         if 'dsrdtr' not in kwargs:
             kwargs['dsrdtr'] = True
@@ -101,8 +117,28 @@ class Scantron:
             if rv == chr(7):
                 raise ValueError("Scantron failed to accept command")
 
-    def _write_form(self, form_def):
+    def _reset(self):
         self._send_command('SRST')
-        for c in form_def.commands():
-            _send_command(c)
 
+    def set_threshold(darkness, contrast):
+        """
+        darkness = Value from 0-99, for something to register as a mark.
+        higher number = darker marks
+        contrast = value from 0-99, difference between marks and non-marks
+        higher number = more contrast
+        """
+        if darkness not in range(0, 100):
+            raise ValueError('darkness value must be 0-99')
+        if contrast not in range(0, 100):
+            raise ValueError('contrast must be 0-99')
+        self._send_command('THR=%d %d' % (darkness, contrast))
+
+    def write_form_definition(self, form_def):
+        self._reset()
+        for c in form_def.commands:
+            self._send_command(c)
+
+    def read_form(self):
+        rv = self._send_command('READ 0 Y')
+        if rv == Scantron.END_OF_BATCH:
+            raise EndOfBatchException("End of batch.")
